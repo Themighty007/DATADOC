@@ -1,3 +1,4 @@
+import sys
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -25,7 +26,14 @@ app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
-console = Console()
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+console = Console(legacy_windows=False)
 plugins_app = typer.Typer(help="Inspect and manage plugins.")
 app.add_typer(plugins_app, name="plugins")
 
@@ -198,6 +206,12 @@ def _load_toml_file(path: Path) -> dict[str, Any]:
 def _find_and_load_config(explicit: Optional[str] = None) -> tuple[dict[str, Any], Optional[Path]]:
     if explicit:
         p = Path(explicit)
+        if p.exists() and p.suffix == ".json":
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                return raw.get("config", raw), p
+            except Exception:
+                pass
         return _load_toml_file(p), p if p.exists() else None
     # search upward from cwd
     cwd = Path.cwd()
@@ -251,6 +265,7 @@ def _pipeline_config(
     preset: Optional[str] = None,
     config_file: Optional[str] = None,
     config_dict: Optional[dict] = None,
+    plugins: Optional[list[str]] = None,
 ) -> PipelineConfig:
     # load config file if not passed
     file_cfg, _ = _find_and_load_config(config_file) if config_dict is None else (config_dict, None)
@@ -304,6 +319,12 @@ def _pipeline_config(
         resolved_ignored = list(file_cfg.get("ignored_columns", []) or [])
     strict_schema = choose("strict_schema", strict_schema, True)
 
+    custom_interactions = file_cfg.get("custom_interactions", []) or []
+    custom_transforms = file_cfg.get("custom_transforms", []) or []
+
+    # plugins list from explicit arg or file config
+    resolved_plugins = list(plugins) if plugins else list(file_cfg.get("plugins", []) or [])
+
     return PipelineConfig(
         target=target,
         task=task,  # type: ignore
@@ -321,6 +342,9 @@ def _pipeline_config(
         identifier_columns=resolved_identifiers,
         ignored_columns=resolved_ignored,
         strict_schema=strict_schema,
+        custom_interactions=custom_interactions,
+        custom_transforms=custom_transforms,
+        plugins=resolved_plugins,
     )
 
 
@@ -579,6 +603,9 @@ def pipeline_plan(
     preset: Optional[str] = typer.Option(
         None, "--preset", help=f"Preset: {', '.join(PRESETS)}", rich_help_panel="Config"
     ),
+    plugin: Optional[list[str]] = typer.Option(
+        None, "--plugin", help="Repeatable: include plugin in pipeline (e.g. MissingValuePlugin).", rich_help_panel="Plugins"
+    ),
 ):
     """Create an explainable transformation plan without applying it."""
     file_cfg, cfg_path = _find_and_load_config(config)
@@ -594,6 +621,7 @@ def pipeline_plan(
         config_dict=file_cfg,
         preset=preset,
         config_file=config,
+        plugins=plugin,
     )  # type: ignore
     try:
         result = DataDocPipeline(pipe_cfg).plan(read_dataset(file_path)).to_dict()
@@ -690,6 +718,9 @@ def fit(
     strict_schema: bool = typer.Option(
         True, "--strict-schema/--no-strict-schema", rich_help_panel="Data"
     ),
+    plugin: Optional[list[str]] = typer.Option(
+        None, "--plugin", help="Repeatable: include plugin in pipeline (e.g. MissingValuePlugin).", rich_help_panel="Plugins"
+    ),
 ):
     """Fit a pipeline only on a training dataset and save its artifact."""
     file_cfg, cfg_path = _find_and_load_config(config)
@@ -712,6 +743,7 @@ def fit(
         preset=preset,
         config_file=config,
         config_dict=file_cfg,
+        plugins=plugin,
     )  # type: ignore
     try:
         pipeline = DataDocPipeline(pipe_cfg).fit(read_dataset(file_path))
@@ -1524,6 +1556,113 @@ def ui(
     if not no_browser:
         webbrowser.open(url)
     uvicorn.run("datadoc.cli.ui_server:app", host="127.0.0.1", port=port, log_level="info")
+
+
+# ──────────────────────────────────────────────────────────────
+# COMMAND: agent
+# ──────────────────────────────────────────────────────────────
+@app.command()
+def agent(
+    file_path: str = typer.Argument(..., help="CSV or Parquet dataset file."),
+    target: Optional[str] = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help="Target column. If omitted, agent will prompt or infer.",
+        rich_help_panel="Data",
+    ),
+    iterations: int = typer.Option(
+        3, "--iterations", "-i", help="Number of auto-research loops.", rich_help_panel="Agent"
+    ),
+    interactive: bool = typer.Option(
+        False, "--interactive", help="Prompt user for domain knowledge.", rich_help_panel="Agent"
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", help="Preferred LLM to use.", rich_help_panel="Agent"
+    ),
+    output: str = typer.Option(
+        "pipeline.json", "--output", "-o", help="Output JSON artifact.", rich_help_panel="Output"
+    ),
+):
+    """Run the Agentic Auto-Research Loop to discover features."""
+    try:
+        from datadoc.ai.agent_runner import DataDocAgent
+    except ImportError as e:
+        raise typer.BadParameter("pip install 'datadoc-cli[ai]' for agent features.") from e
+
+    df = read_dataset(file_path)
+
+    # Resolve / auto-detect target column
+    if not target:
+        common_candidates = [
+            "survived",
+            "target",
+            "label",
+            "churn",
+            "status",
+            "class",
+            "price",
+            "sale_price",
+            "outcome",
+            "y",
+        ]
+        detected_col = None
+        for col in df.columns:
+            if col.lower() in common_candidates:
+                detected_col = col
+                break
+
+        if interactive:
+            if detected_col:
+                use_detected = typer.confirm(
+                    f"Agent detected potential target column '{detected_col}'. Use this?",
+                    default=True,
+                )
+                if use_detected:
+                    target = detected_col
+                else:
+                    console.print(f"[dim]Available columns: {', '.join(df.columns)}[/dim]")
+                    target = typer.prompt("Please specify target column name")
+            else:
+                console.print(f"[dim]Available columns: {', '.join(df.columns)}[/dim]")
+                target = typer.prompt("Please specify target column name")
+        else:
+            if detected_col:
+                console.print(f"[dim]Auto-detected target column: '{detected_col}'[/dim]")
+                target = detected_col
+            else:
+                console.print(
+                    f"[red]Error: Target column must be specified via --target when non-interactive. Available columns: {', '.join(df.columns)}[/red]"
+                )
+                raise typer.Exit(1)
+
+    # Case-insensitive resolution
+    if target not in df.columns:
+        match = next((c for c in df.columns if c.lower() == target.lower()), None)
+        if match:
+            target = match
+        else:
+            console.print(
+                f"[red]Error: Target column '{target}' not found in dataset. Columns: {', '.join(df.columns)}[/red]"
+            )
+            raise typer.Exit(1)
+
+    try:
+        agent_runner = DataDocAgent(target=target, model=model)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    final_config = agent_runner.run_interactive(df, iterations=iterations, interactive=interactive)
+
+    console.print("\n[cyan]Fitting final pipeline with discovered features...[/cyan]")
+    pipeline = DataDocPipeline(final_config).fit(df, target=target)
+    pipeline.save(output)
+
+    console.print(f"[green]Agent finished. Final leakage-safe pipeline saved to {output}[/green]")
+    console.print(
+        f"[dim]Run `datadoc plan {file_path} --config {output} --explain` to see the full plan.[/dim]"
+    )
 
 
 if __name__ == "__main__":

@@ -108,6 +108,10 @@ class PipelineConfig:
     strict_schema: bool = True
     time_column: str | None = None
     group_column: str | None = None
+    custom_interactions: list[dict[str, str]] = field(default_factory=list)
+    custom_transforms: list[dict[str, str]] = field(default_factory=list)
+    plugins: list[str] = field(default_factory=list)
+    plugin_options: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def resolved_scaling(self) -> Literal["none", "standard", "robust"]:
         if self.scaling != "auto":
@@ -508,6 +512,49 @@ class DataDocPipeline:
                     "reason": f"{scaling.title()} scaling (center/spread from train only, binaries excluded).",
                 }
             )
+        for interaction in self.config.custom_interactions:
+            col_a = interaction.get("col_a")
+            col_b = interaction.get("col_b")
+            op = interaction.get("op")
+            rationale = (
+                interaction.get("rationale") or f"Discovered interaction: {col_a} {op} {col_b}"
+            )
+            operations.append(
+                {
+                    "operation": "custom_interaction",
+                    "column": f"{col_a}_{op}_{col_b}",
+                    "reason": rationale,
+                }
+            )
+
+        for transform in self.config.custom_transforms:
+            col = transform.get("col")
+            t_name = transform.get("transform")
+            rationale = transform.get("rationale") or f"Discovered transform: {t_name}({col})"
+            operations.append(
+                {
+                    "operation": "custom_transform",
+                    "column": f"{col}_{t_name}",
+                    "reason": rationale,
+                }
+            )
+
+        if self.config.plugins:
+            try:
+                from datadoc.plugins.registry import resolve_plugins
+
+                active_plugins = resolve_plugins(self.config.plugins)
+                for plug in active_plugins:
+                    operations.append(
+                        {
+                            "operation": f"plugin_{plug.name}",
+                            "column": "*",
+                            "reason": plug.explain(),
+                        }
+                    )
+            except Exception:
+                pass
+
         self.plan_ = TransformPlan(operations, profile.findings, self.config.protected_columns)
         return self.plan_
 
@@ -562,6 +609,7 @@ class DataDocPipeline:
             "categorical": {},
             "datetime": {},
             "scaling": {},
+            "plugins": {},
         }
 
         for name, role in role_map.items():
@@ -676,6 +724,17 @@ class DataDocPipeline:
                         "center": float(center),
                         "spread": float(spread),
                     }
+
+        if self.config.plugins:
+            try:
+                from datadoc.plugins.registry import resolve_plugins
+
+                active_plugins = resolve_plugins(self.config.plugins)
+                for plug in active_plugins:
+                    plug_state = plug.fit(train_df)
+                    state["plugins"][plug.name] = plug_state
+            except Exception as e:
+                warnings.warn(f"Failed to fit plugins: {e}")
 
         transformed = self._transform_with_state(train_df, state, validate_schema=False)
         self.state_ = state
@@ -814,11 +873,71 @@ class DataDocPipeline:
                     )
                 ).drop(name)
 
+        # Apply custom interactions (Agent proposed)
+        for interaction in self.config.custom_interactions:
+            col_a = interaction.get("col_a")
+            col_b = interaction.get("col_b")
+            op = interaction.get("op")
+            if col_a in output.columns and col_b in output.columns:
+                try:
+                    # ensure numeric
+                    expr_a = pl.col(col_a).cast(pl.Float64)
+                    expr_b = pl.col(col_b).cast(pl.Float64)
+                    if op == "add":
+                        expr = expr_a + expr_b
+                    elif op == "sub":
+                        expr = expr_a - expr_b
+                    elif op == "mul":
+                        expr = expr_a * expr_b
+                    elif op == "div":
+                        # avoid div by zero
+                        expr = expr_a / (expr_b.replace(0.0, None))
+                    else:
+                        continue
+                    output = output.with_columns(expr.alias(f"{col_a}_{op}_{col_b}"))
+                except Exception:
+                    pass
+
+        # Apply custom transforms (Agent proposed)
+        for transform in self.config.custom_transforms:
+            col = transform.get("col")
+            op = transform.get("transform")
+            if col in output.columns:
+                try:
+                    expr = pl.col(col).cast(pl.Float64)
+                    if op == "log1p":
+                        # avoid log of negative
+                        expr = pl.when(expr >= -1).then((expr + 1).log()).otherwise(None)
+                    elif op == "sqrt":
+                        expr = pl.when(expr >= 0).then(expr.sqrt()).otherwise(None)
+                    elif op == "square":
+                        expr = expr * expr
+                    else:
+                        continue
+                    output = output.with_columns(expr.alias(f"{col}_{op}"))
+                except Exception:
+                    pass
+
         for name, spec in state["scaling"].items():
             if name in output.columns and name != target:
                 output = output.with_columns(
                     ((pl.col(name) - spec["center"]) / spec["spread"]).alias(name)
                 )
+
+        # Apply active plugins with fitted state
+        plugin_states = state.get("plugins", {})
+        if self.config.plugins or plugin_states:
+            try:
+                from datadoc.plugins.registry import resolve_plugins
+
+                plugin_names = self.config.plugins or list(plugin_states.keys())
+                active_plugins = resolve_plugins(plugin_names)
+                for plug in active_plugins:
+                    plug_state = plugin_states.get(plug.name, {})
+                    output = plug.transform(output, plug_state)
+            except Exception as e:
+                warnings.warn(f"Failed to transform plugins: {e}")
+
         return output
 
     def transform(self, df: pl.DataFrame) -> pl.DataFrame:
